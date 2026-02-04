@@ -54,6 +54,12 @@ try:
         RiskRegime
     )
     from .cerebras_inference import (
+        InferenceClient,
+        LocalSimulator,
+        SepsisRiskAnalyzer,
+        InferenceResult,
+        LatencyMetrics,
+        # Legacy compatibility
         CerebrasClient,
         CerebrasRiskEngine,
         MultiCycleReasoner,
@@ -84,6 +90,12 @@ except ImportError:
         RiskRegime
     )
     from cerebras_inference import (
+        InferenceClient,
+        LocalSimulator,
+        SepsisRiskAnalyzer,
+        InferenceResult,
+        LatencyMetrics,
+        # Legacy compatibility
         CerebrasClient,
         CerebrasRiskEngine,
         MultiCycleReasoner,
@@ -193,78 +205,114 @@ class SepsisSimulationEngine:
         cerebras_config: Optional[CerebrasConfig] = None,
         simulation_config: Optional[SimulationConfig] = None,
         cerebras_api_key: Optional[str] = None,
-        use_cerebras_llm: bool = True
+        use_cerebras_llm: bool = True,
+        model_tier: str = "balanced"
     ):
         """
         Initialize the simulation engine.
         
+        ARCHITECTURE:
+        -------------
+        - ALL simulation logic runs LOCALLY (time-series, features, visualization)
+        - Cerebras is used ONLY for inference (stateless API calls)
+        - Clean separation: InferenceClient (remote) + LocalSimulator (local)
+        
         Args:
             cerebras_config: Cerebras Cloud configuration
             simulation_config: Simulation parameters
-            cerebras_api_key: API key for Cerebras Cloud
-            use_cerebras_llm: Whether to use Cerebras LLM for risk analysis
+            cerebras_api_key: API key for Cerebras Cloud (for inference only)
+            use_cerebras_llm: Whether to use Cerebras for inference
+            model_tier: Model tier ("fast", "balanced", "accurate")
         """
         self.cerebras_config = cerebras_config or CerebrasConfig()
         self.simulation_config = simulation_config or SimulationConfig()
         self._use_cerebras_llm = use_cerebras_llm
+        self._model_tier = model_tier
         
         # Override API key if provided
         if cerebras_api_key:
             self.cerebras_config.api_key = cerebras_api_key
         
-        # Initialize components
-        self._cerebras_client = CerebrasClient(
-            config=self.cerebras_config,
-            api_key=self.cerebras_config.api_key
+        # ==========================================================
+        # NEW CLEAN ARCHITECTURE
+        # ==========================================================
+        
+        # Inference Client - ONLY makes API calls to Cerebras
+        # This is the ONLY thing that talks to Cerebras Cloud
+        self._inference_client = InferenceClient(
+            api_key=self.cerebras_config.api_key,
+            model_tier=model_tier
         )
         
-        # Initialize Cerebras LLM Risk Engine (for API-based analysis)
-        self._cerebras_risk_engine: Optional[CerebrasRiskEngine] = None
-        if self.cerebras_config.api_key and use_cerebras_llm:
-            self._cerebras_risk_engine = CerebrasRiskEngine(
-                api_key=self.cerebras_config.api_key,
-                model_tier="fast",
-                reasoning_cycles=self.cerebras_config.reasoning_cycles_per_timestep
-            )
-            print("[OK] Cerebras LLM Risk Engine initialized - API calls enabled")
-        else:
-            print("[INFO] Running in local simulation mode (no Cerebras API key or LLM disabled)")
+        # Local Simulator - ALL local computation
+        # Time-series, windowing, normalization, aggregation
+        self._local_simulator = LocalSimulator(
+            window_size=10,
+            time_resolution_seconds=60.0
+        )
         
+        # Combined analyzer for convenience
+        self._risk_analyzer = SepsisRiskAnalyzer(
+            api_key=self.cerebras_config.api_key,
+            model_tier=model_tier,
+            window_size=10
+        )
+        
+        # ==========================================================
+        # LOCAL COMPONENTS (never sent to Cerebras)
+        # ==========================================================
+        
+        # Feature extractors - LOCAL
         self._feature_extractors: Dict[str, PhysiologicalFeatureExtractor] = {}
-        self._risk_trackers: Dict[str, BayesianRiskTracker] = {}
-        self._reasoner = MultiCycleReasoner(
-            self._cerebras_client,
-            self.cerebras_config
-        )
         
-        # Synthetic data generator
+        # Risk trackers - LOCAL Bayesian state tracking
+        self._risk_trackers: Dict[str, BayesianRiskTracker] = {}
+        
+        # Synthetic data generator - LOCAL
         self._data_generator = SyntheticDataGenerator(
             config=self.simulation_config
         )
         
-        # Results storage
+        # Results storage - LOCAL
         self._simulation_results: Dict[str, SimulationResult] = {}
         
-        # Metrics
+        # ==========================================================
+        # METRICS (for performance evaluation)
+        # ==========================================================
         self._total_observations_processed = 0
         self._total_processing_time_ms = 0.0
         self._total_cerebras_api_calls = 0
         self._cerebras_api_latency_ms = 0.0
+        self._total_serialization_ms = 0.0
+        self._total_parsing_ms = 0.0
+        
+        # Log initialization status
+        if self._inference_client.is_available():
+            print(f"[ENGINE] ✅ Cerebras inference enabled (model: {self._inference_client.model})")
+            print(f"[ENGINE] Local simulation + Remote inference architecture active")
+        else:
+            print(f"[ENGINE] ⚠️ Running fully local (Cerebras API not available)")
+            print(f"[ENGINE] Status: {self._inference_client.get_status()}")
     
     @property
     def is_using_cerebras_cloud(self) -> bool:
-        """Check if the engine is using Cerebras Cloud API."""
-        return self._cerebras_risk_engine is not None and not self._cerebras_risk_engine._simulation_mode
+        """Check if the engine is using Cerebras Cloud API for inference."""
+        return self._inference_client.is_available()
     
     @property
     def cerebras_mode_status(self) -> str:
         """Get a human-readable status of Cerebras connection."""
-        if self._cerebras_risk_engine is None:
-            return "Local Mode (No API Key)"
-        elif self._cerebras_risk_engine._simulation_mode:
-            return "Local Simulation (API Connection Failed)"
-        else:
-            return f"Cerebras Cloud ({self._cerebras_risk_engine.model})"
+        return self._inference_client.get_status()
+    
+    @property
+    def inference_client(self) -> InferenceClient:
+        """Get the inference client for direct access."""
+        return self._inference_client
+    
+    @property
+    def local_simulator(self) -> LocalSimulator:
+        """Get the local simulator for direct access."""
+        return self._local_simulator
     
     def _get_or_create_extractor(self, patient_id: str) -> PhysiologicalFeatureExtractor:
         """Get or create feature extractor for a patient."""
@@ -293,81 +341,74 @@ class SepsisSimulationEngine:
         """
         Process a single observation for a patient.
         
-        This is the core streaming interface:
-        1. Extract features from vital signs
-        2. Run multi-cycle reasoning (via Cerebras Cloud if available)
-        3. Update risk belief
-        4. Return updated state
+        ARCHITECTURE:
+        -------------
+        1. Extract features from vital signs (LOCAL)
+        2. Add to local trajectory (LOCAL)
+        3. Extract window for inference (LOCAL)
+        4. Call Cerebras for inference (REMOTE, if enabled)
+        5. Update risk belief (LOCAL)
+        6. Return updated state
         
         Args:
             patient_id: Patient identifier
-            timestamp: Observation timestamp
+            timestamp: Observation timestamp (real time, continuous axis)
             vital_values: Dict of vital sign values
-            n_reasoning_cycles: Override default cycle count
-            use_cerebras_api: Whether to use Cerebras Cloud API for this observation
+            n_reasoning_cycles: Override default cycle count (legacy, ignored)
+            use_cerebras_api: Whether to call Cerebras API for inference
             
         Returns:
             Tuple of (updated_belief, extracted_features)
         """
         start_time = time.perf_counter()
         
-        # Get components
+        # ==========================================================
+        # STEP 1: LOCAL - Extract features from vital signs
+        # ==========================================================
         extractor = self._get_or_create_extractor(patient_id)
         tracker = self._get_or_create_tracker(patient_id)
-        
-        # Extract features (local computation)
         features = extractor.extract(timestamp, vital_values)
         
-        # Check if we should use Cerebras Cloud LLM for risk analysis
-        if use_cerebras_api and self._cerebras_risk_engine is not None and self._use_cerebras_llm:
-            # Use Cerebras Cloud API for LLM-based multi-cycle reasoning
-            api_start = time.perf_counter()
-            
-            try:
-                # Call Cerebras LLM API for risk analysis
-                print(f"[ENGINE] Calling Cerebras API for patient {patient_id}...")
-                analysis_result = self._cerebras_risk_engine.analyze_patient(
-                    vitals=vital_values,
-                    patient_history=None  # Could add history tracking
-                )
-                
-                # Convert Cerebras result to belief state
-                belief = RiskBelief(
-                    mean=analysis_result.risk_score,
-                    variance=analysis_result.uncertainty ** 2,
-                    trend=analysis_result.trend_acceleration,
-                    acceleration=0.0
-                )
-                
-                # Update tracker with Cerebras result
-                tracker.belief = belief
-                
-                # Track API metrics
-                api_latency = (time.perf_counter() - api_start) * 1000
-                self._total_cerebras_api_calls += 1
-                self._cerebras_api_latency_ms += api_latency
-                
-            except Exception as e:
-                print(f"[WARN] Cerebras API call failed, falling back to local: {e}")
-                # Fallback to local reasoning
-                n_cycles = n_reasoning_cycles or self.cerebras_config.reasoning_cycles_per_timestep
-                belief, _ = self._reasoner.reason(
-                    features,
-                    tracker.belief,
-                    n_cycles=n_cycles
-                )
-                tracker.belief = belief
-        else:
-            # Use local multi-cycle reasoning (no Cerebras API)
-            n_cycles = n_reasoning_cycles or self.cerebras_config.reasoning_cycles_per_timestep
-            belief, _ = self._reasoner.reason(
-                features,
-                tracker.belief,
-                n_cycles=n_cycles
+        # ==========================================================
+        # STEP 2: LOCAL - Update risk belief using Bayesian tracker
+        # This properly tracks state over time with trends!
+        # ==========================================================
+        if use_cerebras_api and self._inference_client.is_available():
+            # Call Cerebras API for inference
+            patient_data = self._local_simulator.add_reading(
+                patient_id=patient_id,
+                timestamp=timestamp,
+                vitals=vital_values
             )
             
-            # Update tracker
+            inference_result = self._inference_client.infer(patient_data)
+            
+            # Track latency metrics
+            self._total_cerebras_api_calls += 1
+            self._cerebras_api_latency_ms += inference_result.latency.api_roundtrip_ms
+            self._total_serialization_ms += inference_result.latency.serialization_ms
+            self._total_parsing_ms += inference_result.latency.parsing_ms
+            
+            # Update tracker with API result
+            belief = RiskBelief(
+                mean=inference_result.risk_score,
+                variance=inference_result.uncertainty ** 2,
+                trend=tracker.belief.trend,  # Keep tracked trend
+                acceleration=tracker.belief.acceleration
+            )
             tracker.belief = belief
+        else:
+            # LOCAL - Use Bayesian tracker with extracted features
+            # This produces realistic, varying risk scores over time!
+            n_cycles = self.cerebras_config.reasoning_cycles_per_timestep
+            belief = tracker.update(features, n_cycles=n_cycles)
+            
+            # Also add to local simulator for visualization
+            self._local_simulator.add_reading(
+                patient_id=patient_id,
+                timestamp=timestamp,
+                vitals=vital_values
+            )
         
         # Update metrics
         processing_time_ms = (time.perf_counter() - start_time) * 1000
@@ -380,20 +421,19 @@ class SepsisSimulationEngine:
         self,
         trajectory: PatientTrajectory,
         progress_callback: Optional[callable] = None,
-        cerebras_api_interval: int = 5
+        use_cerebras_final: bool = True
     ) -> SimulationResult:
         """
         Run simulation on a complete patient trajectory.
         
-        Uses Cerebras Cloud API for analysis at specified intervals.
-        Local processing is used for intermediate timesteps for efficiency.
+        FAST EXECUTION:
+        - ALL timestep processing runs LOCALLY (instant)
+        - ONE Cerebras API call at the END for final risk classification
         
         Args:
             trajectory: PatientTrajectory object
             progress_callback: Optional callback(step, total) for progress
-            cerebras_api_interval: Call Cerebras API every N timesteps (default: 5)
-                                   Set to 1 for every timestep (slower but most accurate)
-                                   Set to 0 to disable API calls entirely
+            use_cerebras_final: Make ONE API call at end for final classification
             
         Returns:
             SimulationResult with complete time series
@@ -412,28 +452,21 @@ class SepsisSimulationEngine:
         
         total_start = time.perf_counter()
         
-        # Process each timestep
+        # ==========================================================
+        # STEP 1: Process ALL timesteps LOCALLY (fast!)
+        # ==========================================================
         for i in range(n_steps):
-            # Get vital values at this timestep
             vital_values = {k: v[i] for k, v in trajectory.vitals.items()}
-            timestamp = float(i)  # Use index as timestamp for simplicity
+            timestamp = float(i)
             
-            # Determine whether to use Cerebras API for this timestep
-            # Use API at intervals to balance accuracy and cost/latency
-            use_api = (
-                cerebras_api_interval > 0 and 
-                (i % cerebras_api_interval == 0 or i == n_steps - 1)  # Always use API for last step
-            )
-            
-            # Process observation
+            # ALL processing is LOCAL - no API calls during loop
             belief, features = self.process_observation(
                 patient_id,
                 timestamp,
                 vital_values,
-                use_cerebras_api=use_api
+                use_cerebras_api=False  # Never call API during loop
             )
             
-            # Store results
             timestamps.append(timestamp)
             risk_means.append(belief.mean)
             risk_stds.append(np.sqrt(belief.variance))
@@ -441,14 +474,45 @@ class SepsisSimulationEngine:
             abnormality_scores.append(features.abnormality_score)
             instability_scores.append(features.instability_score)
             
-            # Store ground truth if available
             if trajectory.latent_states is not None:
                 state = trajectory.latent_states[i]
                 true_states.append(state.value if hasattr(state, 'value') else str(state))
             
-            # Progress callback
             if progress_callback:
                 progress_callback(i + 1, n_steps)
+        
+        # ==========================================================
+        # STEP 2: ONE Cerebras API call for final classification
+        # ==========================================================
+        if use_cerebras_final and self._inference_client.is_available():
+            # Get final vitals and recent history for API call
+            final_vitals = {k: v[-1] for k, v in trajectory.vitals.items()}
+            recent_history = [
+                {k: v[i] for k, v in trajectory.vitals.items()}
+                for i in range(max(0, n_steps - 6), n_steps)
+            ]
+            
+            # Make ONE API call with patient summary
+            patient_data = {
+                "patient_id": patient_id,
+                "vitals": final_vitals,
+                "window": recent_history,
+                "metrics_available": list(final_vitals.keys())
+            }
+            
+            api_start = time.perf_counter()
+            inference_result = self._inference_client.infer(patient_data)
+            api_latency = (time.perf_counter() - api_start) * 1000
+            
+            # Update final risk score with Cerebras result
+            risk_means[-1] = inference_result.risk_score
+            risk_stds[-1] = inference_result.uncertainty
+            
+            # Track API metrics
+            self._total_cerebras_api_calls += 1
+            self._cerebras_api_latency_ms += api_latency
+            self._total_serialization_ms += inference_result.latency.serialization_ms
+            self._total_parsing_ms += inference_result.latency.parsing_ms
         
         total_time_ms = (time.perf_counter() - total_start) * 1000
         
@@ -466,9 +530,7 @@ class SepsisSimulationEngine:
             total_reasoning_cycles=n_steps * self.cerebras_config.reasoning_cycles_per_timestep
         )
         
-        # Store result
         self._simulation_results[patient_id] = result
-        
         return result
     
     def get_cerebras_metrics(self) -> Dict[str, Any]:
@@ -476,37 +538,55 @@ class SepsisSimulationEngine:
         Get Cerebras Cloud API usage metrics.
         
         Returns:
-            Dictionary with API call statistics
+            Dictionary with API call statistics and latency breakdown.
         """
-        avg_api_latency = (
-            self._cerebras_api_latency_ms / self._total_cerebras_api_calls 
-            if self._total_cerebras_api_calls > 0 else 0.0
-        )
+        n_calls = max(self._total_cerebras_api_calls, 1)
         
         return {
+            # Connection status
             "mode": self.cerebras_mode_status,
             "using_cloud": self.is_using_cerebras_cloud,
+            "model": self._inference_client.model,
+            
+            # API call counts
             "total_api_calls": self._total_cerebras_api_calls,
-            "total_api_latency_ms": self._cerebras_api_latency_ms,
-            "avg_api_latency_ms": avg_api_latency,
             "total_observations": self._total_observations_processed,
             "api_call_ratio": (
                 self._total_cerebras_api_calls / self._total_observations_processed
                 if self._total_observations_processed > 0 else 0.0
-            )
+            ),
+            
+            # Latency breakdown (per requirements)
+            "avg_serialization_ms": self._total_serialization_ms / n_calls,
+            "avg_api_roundtrip_ms": self._cerebras_api_latency_ms / n_calls,
+            "avg_parsing_ms": self._total_parsing_ms / n_calls,
+            "avg_total_latency_ms": (
+                self._total_serialization_ms + 
+                self._cerebras_api_latency_ms + 
+                self._total_parsing_ms
+            ) / n_calls,
+            
+            # Totals
+            "total_api_latency_ms": self._cerebras_api_latency_ms,
+            "total_serialization_ms": self._total_serialization_ms,
+            "total_parsing_ms": self._total_parsing_ms,
         }
     
     def run_batch(
         self,
         trajectories: List[PatientTrajectory],
-        parallel: bool = True
+        parallel: bool = True,
+        use_cerebras_final: bool = True
     ) -> List[SimulationResult]:
         """
         Run simulation on multiple patient trajectories.
         
+        FAST: All processing is local. ONE API call per patient at the end.
+        
         Args:
             trajectories: List of patient trajectories
             parallel: Whether to process patients in parallel
+            use_cerebras_final: Make ONE API call per patient for final classification
             
         Returns:
             List of SimulationResult objects
@@ -515,7 +595,10 @@ class SepsisSimulationEngine:
         
         for i, trajectory in enumerate(trajectories):
             print(f"Processing patient {i+1}/{len(trajectories)}: {trajectory.patient_id}")
-            result = self.run_patient_trajectory(trajectory)
+            result = self.run_patient_trajectory(
+                trajectory, 
+                use_cerebras_final=use_cerebras_final
+            )
             results.append(result)
         
         return results
@@ -524,25 +607,29 @@ class SepsisSimulationEngine:
         self,
         n_septic: int = 10,
         n_stable: int = 10,
-        duration_hours: float = 24
+        duration_hours: float = 24,
+        use_cerebras_final: bool = True
     ) -> Tuple[List[SimulationResult], List[SimulationResult]]:
         """
         Run comparison simulation between septic and stable patients.
         
-        This is useful for:
-        - Validating that the system distinguishes patient types
-        - Generating visualization data
-        - Evaluating accuracy metrics
+        FAST EXECUTION:
+        - All timestep processing runs locally (instant)
+        - ONE API call per patient at the end for final classification
+        - Total API calls = n_septic + n_stable
         
         Args:
             n_septic: Number of septic patients to simulate
             n_stable: Number of stable patients to simulate
             duration_hours: Duration of each trajectory
+            use_cerebras_final: Use Cerebras for final classification (1 call per patient)
             
         Returns:
             Tuple of (septic_results, stable_results)
         """
         print(f"Generating {n_septic} septic and {n_stable} stable patients...")
+        if use_cerebras_final and self._use_cerebras_llm:
+            print(f"Cerebras API: {n_septic + n_stable} calls total (1 per patient)")
         
         # Generate septic patients
         septic_trajectories = [
@@ -566,9 +653,15 @@ class SepsisSimulationEngine:
         
         print("Running simulations...")
         
-        # Run simulations
-        septic_results = self.run_batch(septic_trajectories)
-        stable_results = self.run_batch(stable_trajectories)
+        # Run simulations - all local, ONE API call per patient at end
+        septic_results = self.run_batch(
+            septic_trajectories, 
+            use_cerebras_final=use_cerebras_final
+        )
+        stable_results = self.run_batch(
+            stable_trajectories, 
+            use_cerebras_final=use_cerebras_final
+        )
         
         return septic_results, stable_results
     

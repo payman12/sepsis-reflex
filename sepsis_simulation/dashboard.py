@@ -221,19 +221,10 @@ with st.sidebar:
     else:
         st.info("💻 No API Key - Running in local simulation mode")
     
-    # Cerebras API call frequency
-    cerebras_api_interval = st.slider(
-        "API Call Interval",
-        min_value=1,
-        max_value=20,
-        value=5,
-        help="Call Cerebras API every N timesteps (1=every step, higher=faster but less accurate)"
-    )
-    
     use_cerebras_llm = st.checkbox(
-        "Use Cerebras LLM Analysis",
-        value=True,
-        help="Enable Cerebras Cloud LLM for multi-cycle reasoning"
+        "Use Cerebras for Final Analysis",
+        value=False,
+        help="If enabled, makes ONE API call at the end for final risk summary. Simulation always runs fast locally."
     )
     
     st.markdown("---")
@@ -279,6 +270,8 @@ with st.sidebar:
         try:
             metrics = st.session_state.engine.get_cerebras_metrics()
             st.metric("Mode", metrics["mode"])
+            st.caption(f"Model: {metrics.get('model', 'N/A')}")
+            
             if metrics["total_api_calls"] > 0:
                 st.metric("API Calls", f"{metrics['total_api_calls']:,}")
                 st.metric("Avg API Latency", f"{metrics['avg_api_latency_ms']:.1f} ms")
@@ -327,6 +320,8 @@ with tab1:
         if st.button("🚀 Run Simulation", type="primary", use_container_width=True):
             with st.spinner("Initializing simulation engine..."):
                 # Create engine with Cerebras configuration
+                # Note: Cerebras is used ONLY for inference
+                # All simulation logic runs locally
                 cerebras_config = CerebrasConfig(
                     api_key=cerebras_api_key if cerebras_api_key else None,
                     reasoning_cycles_per_timestep=n_reasoning_cycles
@@ -348,13 +343,13 @@ with tab1:
                     st.info(f"💻 {st.session_state.engine.cerebras_mode_status}")
             
             with st.spinner("Running comparison simulation..."):
-                # Store API interval for trajectory processing
-                st.session_state.cerebras_api_interval = cerebras_api_interval
-                
+                # Simulation runs FAST locally
+                # ONE API call per patient at end (if checkbox enabled)
                 septic_results, stable_results = st.session_state.engine.run_comparison(
                     n_septic=n_septic,
                     n_stable=n_stable,
-                    duration_hours=duration_hours
+                    duration_hours=duration_hours,
+                    use_cerebras_final=use_cerebras_llm  # ONE call per patient if enabled
                 )
                 
                 st.session_state.septic_results = septic_results
@@ -367,12 +362,12 @@ with tab1:
                     simulation_mode="comparison"
                 )
             
-            # Show Cerebras metrics
-            if st.session_state.engine.is_using_cerebras_cloud:
-                metrics = st.session_state.engine.get_cerebras_metrics()
-                st.success(f"✅ Simulation complete! Cerebras API calls: {metrics['total_api_calls']}")
+            # Show completion message
+            metrics = st.session_state.engine.get_cerebras_metrics()
+            if metrics['total_api_calls'] > 0:
+                st.success(f"✅ Simulation complete! Made {metrics['total_api_calls']} Cerebras API calls (1 per patient)")
             else:
-                st.success("✅ Simulation complete!")
+                st.success("✅ Simulation complete! (local mode - no API calls)")
     
     with col1:
         st.markdown("""
