@@ -1,0 +1,6 @@
+patient_id,develops_sepsis,sepsis_onset_hours,sepsis_onset_timestep,severity,duration_hours,total_timesteps
+P0001,False,,,0,48,48
+P0002,True,22.0,22.0,2,48,48
+P0003,True,25.0,25.0,3,48,48
+P0004,False,,,0,48,48
+P0005,False,,,0,48,48

@@ -1,0 +1,36 @@
+{
+  "n_patients": 20,
+  "n_sepsis": 10,
+  "n_non_sepsis": 10,
+  "auroc": 1.0,
+  "auprc": 0.9999999999999999,
+  "accuracy": 0.65,
+  "f1": 0.46153846153846156,
+  "sensitivity": 0.3,
+  "specificity": 1.0,
+  "ppv": 1.0,
+  "npv": 0.5882352941176471,
+  "point_metrics": {
+    "final": {
+      "auroc": 1.0,
+      "accuracy": 0.65,
+      "f1": 0.46153846153846156
+    },
+    "at_onset": {
+      "auroc": 1.0,
+      "accuracy": 0.5,
+      "f1": 0.0
+    },
+    "6h_before": {
+      "auroc": 0.6399999999999999,
+      "accuracy": 0.5,
+      "f1": 0.0
+    },
+    "12h_before": {
+      "auroc": 0.3,
+      "accuracy": 0.5,
+      "f1": 0.0
+    }
+  },
+  "timestamp": "2026-02-03T11:07:14.565137"
+}

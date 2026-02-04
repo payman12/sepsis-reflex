@@ -1,0 +1,26 @@
+# Sepsis Reflex Agent Requirements
+# =================================
+
+# Core dependencies
+streamlit>=1.30.0
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+
+# Deep Learning
+torch>=2.0.0
+
+# Cerebras Cloud Integration
+cerebras-cloud-sdk>=1.0.0
+
+# Visualization
+plotly>=5.0.0
+matplotlib>=3.7.0
+
+# Utilities
+joblib>=1.3.0
+tqdm>=4.65.0
+
+# Optional: For advanced metrics
+# seaborn>=0.12.0
